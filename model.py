@@ -4,7 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from transformer_block_updated import TransformerConfig, TransformerTower
+# from transformer_pair_update_block import TransformerConfig, TransformerTower
+from transformer_block import TransformerConfig, TransformerTower
+
 # =============================== CONFIG ===============================
 
 @dataclass
@@ -196,7 +198,8 @@ class ProteinMLMModel(nn.Module):
 
         # Transformer 
         # print("Entering TransformerTower:", x.shape, flush=True)
-        x, pair_x = self.transformer_tower(x)
+        # x, pair_x = self.transformer_tower(x)
+        x = self.transformer_tower(x)
         # print("After transformer_tower: x =", x.shape, flush=True)
         # print("pair_x =", pair_x.shape, flush=True)
 

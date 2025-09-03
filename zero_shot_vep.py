@@ -10,7 +10,7 @@ from mask_utils import mask_input_hf
 
 # --------------------------- VEP Eval ---------------------------
 
-def compute_log_odds_vep(model, tokenizer, seq, pos, ref, alt, device, min_length, max_length=512):
+def compute_log_odds_vep(model, tokenizer, seq, pos, ref, alt, device, min_length, max_length=8192):
     if len(seq) < min_length:
         return None
     if pos < 0 or pos >= len(seq) or seq[pos] != ref:
@@ -40,7 +40,7 @@ def compute_log_odds_vep(model, tokenizer, seq, pos, ref, alt, device, min_lengt
 
     return (torch.log(probs[alt_id]) - torch.log(probs[ref_id])).item()
 
-def run_vep_eval(model, tokenizer, device, df, step, csv_path, min_length, max_length=512):
+def run_vep_eval(model, tokenizer, device, df, step, csv_path, min_length, max_length=8192):
     print(f"Running zero-shot VEP evaluation @ step {step}", flush=True)
     log_odds_scores = []
     labels = []

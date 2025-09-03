@@ -30,4 +30,4 @@ cd /gpfs/data/brandeslab/Project/u-net/
 #   --log_dir       /gpfs/data/brandeslab/Project/u-net/logs_unet \
 #   --batch_size 64 --epochs 500 --lr 1e-4 --num_workers 16 
 
-python new_train.py
+python HF_train.py
