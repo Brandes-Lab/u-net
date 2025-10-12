@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-# from transformer_pair_update_block import TransformerConfig, TransformerTower
 from transformer_block import TransformerConfig, TransformerTower
 
 # =============================== CONFIG ===============================
@@ -15,19 +14,20 @@ class ModelConfig:
     mask_token_id: int = 4
     mask_prob: float = 0.15
     base_dim: int = 256
-    growth: int = 64
-    num_scales: int = 4
+    growth: int = 32
+    num_scales: int = 2
     kernel_size: int = 5
     initial_conv_kernel: int = 15
     pool_factor: int = 2
     upsample_mode: str = "nearest"
+    dilation_schedule: Optional[Tuple[int, ...]] = None
     
     transformer_cfg: TransformerConfig = TransformerConfig()
 
     @property
     def bottleneck_dim(self) -> int:
         return self.base_dim + self.num_scales * self.growth
-
+    
     @property
     def total_downsample(self) -> int:
         return self.pool_factor ** self.num_scales
@@ -52,11 +52,11 @@ class ConvBlock(nn.Module):
     Expects and returns tensors in [B, L, C] (batch, length, channels).
     Internally transposes to [B, C, L] for Conv1d, then transposes back.
     """
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 5) -> None:
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 5, dilation: int = 1) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(in_channels)
         self.act = nn.GELU()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=kernel_size // 2)
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=(kernel_size // 2) * dilation, dilation=dilation) 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, L, C_in]
@@ -79,11 +79,11 @@ class DownBlock(nn.Module):
     Skip  : [B, L, C_in + growth]
     Output: [B, L//pool_factor, C_in + growth]
     """
-    def __init__(self, in_channels: int, growth: int = 128, pool_factor: int = 2, kernel_size: int = 5) -> None:
+    def __init__(self, in_channels: int, growth: int = 128, pool_factor: int = 2, kernel_size: int = 5, dilation: int = 1) -> None:
         super().__init__()
         out_channels = in_channels + growth
-        self.conv1 = ConvBlock(in_channels, out_channels, kernel_size=kernel_size)
-        self.conv2 = ConvBlock(out_channels, out_channels, kernel_size=kernel_size)
+        self.conv1 = ConvBlock(in_channels, out_channels, kernel_size=kernel_size, dilation=dilation)
+        self.conv2 = ConvBlock(out_channels, out_channels, kernel_size=kernel_size, dilation=dilation)
         self.pool = nn.MaxPool1d(kernel_size=pool_factor, stride=pool_factor)
         self.growth = growth
 
@@ -91,7 +91,7 @@ class DownBlock(nn.Module):
         residual = x                                    # [B, L, C_in]
         x = self.conv1(x)                               # [B, L, C_in + growth]
 
-        # Can’t add residual ([B, L, C_in]) directly to x ([B, L, C_in + growth])
+        # Can't add residual ([B, L, C_in]) directly to x ([B, L, C_in + growth])
         # zero-pad residual to match the new channel dimension:
         pad = torch.zeros_like(x[..., :self.growth])    # [B, L, growth]
         x = x + torch.cat([residual, pad], dim=-1)      # [B, L, C_in + growth]
@@ -102,9 +102,6 @@ class DownBlock(nn.Module):
         x = self.pool(x).transpose(1, 2)                # [B, L//2, C]
         return x, skip
 
-# If input x is [B, 512, 512] with growth=96, output from one interation will be:
-# x: [B, 256, 608] (sequence halved, channels increased)
-# skip: [B, 512, 608] (stored for decoder)
 
 class UpBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, upsample_mode: str = "nearest", kernel_size: int = 5) -> None:
@@ -127,89 +124,99 @@ class UpBlock(nn.Module):
         return x
 
 
-
-
 # ================================ MODEL ================================
 
 class ProteinMLMModel(nn.Module):
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
         self.cfg = cfg
-        # starting with [B, S] = [64, 512], 64 sequences, each 512 tokens long
+        
         # Embedding
-        self.embed = nn.Embedding(cfg.vocab_size, cfg.base_dim) # [B, S, base_dim] = [64, 512, 512] 
-
-        # 1D convolutional layer, Input = [Batch, Channels, Length] = [B, 512, 512], Output = [B, 512, 512]
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.base_dim)
+        
+        # Initial conv
         self.initial_conv = nn.Conv1d(cfg.base_dim, cfg.base_dim, kernel_size=cfg.initial_conv_kernel, padding=cfg.initial_conv_kernel // 2)
         
-        # Conv Block, Input = [B, 512, 512], Output = [B, 512, 512]
+        # Conv Block
         self.conv_block = ConvBlock(cfg.base_dim, cfg.base_dim, kernel_size=cfg.kernel_size)
         
-        # Sequence Encoder, decrease seq length, increase number of channels 
-            # 512 → 256 → 128 → 64 → 32 → 16 → 8
-            # enc_in_channels = [
-            #         512 + 1 * 96,  # 608
-            #         512 + 2 * 96,  # 704
-            #         512 + 3 * 96,  # 800
-            #         512 + 4 * 96,  # 896
-            #         512 + 5 * 96   # 992
-            #         512 + 6 * 96   # 1088
-            #     ]
+        # Encoder
         enc_in_channels = [cfg.base_dim + i * cfg.growth for i in range(cfg.num_scales)]
+        dilations = getattr(cfg, "dilation_schedule", None) or (1,)*cfg.num_scales
         self.enc_blocks = nn.ModuleList([
-            DownBlock(cin, growth=cfg.growth, pool_factor=cfg.pool_factor, kernel_size=cfg.kernel_size)
-            for cin in enc_in_channels
+            DownBlock(cin, growth=cfg.growth, pool_factor=cfg.pool_factor, kernel_size=cfg.kernel_size, dilation=dil)
+            for cin, dil in zip(enc_in_channels, dilations)
         ])
 
-        self.transformer_tower = TransformerTower(self.cfg.transformer_cfg)
+        # Transformer
+        self.transformer_cfg = TransformerConfig(dim=cfg.bottleneck_dim)
+        self.transformer_tower = TransformerTower(self.transformer_cfg)
 
-        # Sequence Decoder, Increase seq length, decrease number of channels 
-        # in_channels   : [1088, 992, 896, 800, 704, 608]   # From upsample + skip concat
-        # out_channels  :  [992, 896, 800, 704, 608, 512]   # Output size of each UpBlock
+        # Decoder
         self.dec_in_channels  = [cfg.base_dim + i * cfg.growth for i in reversed(range(1, cfg.num_scales + 1))]
         self.dec_out_channels = [cfg.base_dim + i * cfg.growth for i in reversed(range(cfg.num_scales))]
         self.dec_blocks = nn.ModuleList([
             UpBlock(in_ch, out_ch, upsample_mode=cfg.upsample_mode, kernel_size=cfg.kernel_size)
             for in_ch, out_ch in zip(self.dec_in_channels, self.dec_out_channels)
         ])
+        
+        # Output layer
         self.output_layer = nn.Linear(cfg.base_dim, cfg.vocab_size)
 
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        # print("Input token_ids:", token_ids.shape, flush=True)  # [B, L]
+    def forward(
+        self, 
+        token_ids: torch.Tensor = None,
+        input_ids: torch.Tensor = None,
+        labels: torch.Tensor = None,
+        return_dict: bool = False,
+        **kwargs
+    ):
+        """
+        Forward pass with optional HF-style arguments.
+        
+        Args:
+            token_ids: Token IDs [B, L] (original name)
+            input_ids: Token IDs [B, L] (HF standard name)
+            labels: Ground truth labels (accepted for HF compatibility but not used)
+            return_dict: Whether to return dict (for HF compatibility)
+            **kwargs: Additional arguments (ignored)
+        
+        Returns:
+            logits [B, L, vocab_size] or dict with 'logits' key
+        """
+        # Handle both input_ids (HF standard) and token_ids (your original)
+        # Priority: token_ids first (for explicit calls), then input_ids
+        x = token_ids if token_ids is not None else input_ids
+        
+        if x is None:
+            raise ValueError("Either token_ids or input_ids must be provided")
         
         # Embedding
-        x = self.embed(token_ids)  # [B, L, base_dim]
-        # print("After embedding:", x.shape, flush=True)
-
+        x = self.embed(x).clone()  # [B, L, base_dim]
+        
         # Initial conv
-        x = self.initial_conv(x.transpose(1, 2)).transpose(1, 2)  # [B, L, base_dim]
-        # print("After initial_conv:", x.shape, flush=True)
+        x = self.initial_conv(x.transpose(1, 2)).transpose(1, 2)
         
         # Residual conv block
-        x = x + self.conv_block(x)  # [B, L, base_dim]
-        # print("After conv_block:", x.shape, flush=True)
+        x = x + self.conv_block(x).clone()
         
         # Encoder
         skips = []
-        for i, block in enumerate(self.enc_blocks):
+        for block in self.enc_blocks:
             x, skip = block(x)
             skips.append(skip)
-            # print(f"After encoder block {i}: x = {x.shape}, skip = {skip.shape}", flush=True)
-
-        # Transformer 
-        # print("Entering TransformerTower:", x.shape, flush=True)
-        # x, pair_x = self.transformer_tower(x)
+        
+        # Transformer
         x = self.transformer_tower(x)
-        # print("After transformer_tower: x =", x.shape, flush=True)
-        # print("pair_x =", pair_x.shape, flush=True)
-
+        
         # Decoder
-        for i, (block, skip) in enumerate(zip(self.dec_blocks, reversed(skips))):
+        for block, skip in zip(self.dec_blocks, reversed(skips)):
             x = block(x, skip)
-            # print(f"After decoder block {i}: x = {x.shape}", flush=True)
-
-        # Final output layer
+        
+        # Output
         logits = self.output_layer(x)
-        # print("Final logits:", logits.shape, flush=True)  # [B, L, vocab_size]
-
+        
+        # Return format
+        if return_dict:
+            return {"logits": logits}
         return logits
